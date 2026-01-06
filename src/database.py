@@ -223,6 +223,46 @@ class TradingDatabase:
                 );
             """)
             
+            # Positions table - track open/closed trades
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS positions (
+                    id SERIAL PRIMARY KEY,
+                    signal_id INTEGER REFERENCES signals(id),
+                    
+                    -- Status
+                    status VARCHAR(20) DEFAULT 'OPEN',  -- OPEN, CLOSED, EXPIRED
+                    
+                    -- Entry
+                    entry_time TIMESTAMPTZ DEFAULT NOW(),
+                    entry_spy_price DECIMAL(10, 2),
+                    action_name VARCHAR(50),
+                    
+                    -- Levels
+                    spy_target DECIMAL(10, 2),
+                    spy_stop DECIMAL(10, 2),
+                    breakeven DECIMAL(10, 2),
+                    
+                    -- Trade details
+                    contracts INTEGER DEFAULT 1,
+                    max_profit DECIMAL(10, 2),
+                    max_loss DECIMAL(10, 2),
+                    
+                    -- Current state
+                    current_spy_price DECIMAL(10, 2),
+                    unrealized_pnl DECIMAL(10, 2),
+                    last_updated TIMESTAMPTZ DEFAULT NOW(),
+                    
+                    -- Exit
+                    exit_time TIMESTAMPTZ,
+                    exit_spy_price DECIMAL(10, 2),
+                    exit_reason VARCHAR(50),  -- TARGET, STOP_LOSS, REVERSAL, MANUAL, EXPIRED
+                    realized_pnl DECIMAL(10, 2)
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_positions_status 
+                ON positions(status);
+            """)
+            
             self.conn.commit()
             print("✓ Database tables created")
     
@@ -472,6 +512,99 @@ class TradingDatabase:
             """, (limit,))
             
             return [dict(row) for row in cur.fetchall()]
+    
+    # =====================================================
+    # POSITION MANAGEMENT
+    # =====================================================
+    
+    def open_position(
+        self,
+        signal_id: int,
+        entry_spy_price: float,
+        action_name: str,
+        spy_target: float,
+        spy_stop: float,
+        breakeven: float,
+        max_profit: float,
+        max_loss: float,
+        contracts: int = 1
+    ) -> int:
+        """Open a new position."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO positions (
+                    signal_id, entry_spy_price, action_name,
+                    spy_target, spy_stop, breakeven,
+                    contracts, max_profit, max_loss,
+                    current_spy_price, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                RETURNING id
+            """, (
+                signal_id, entry_spy_price, action_name,
+                spy_target, spy_stop, breakeven,
+                contracts, max_profit, max_loss,
+                entry_spy_price
+            ))
+            
+            pos_id = cur.fetchone()[0]
+            self.conn.commit()
+            return pos_id
+    
+    def get_open_positions(self) -> List[Dict]:
+        """Get all open positions."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM positions
+                WHERE status = 'OPEN'
+                ORDER BY entry_time DESC
+            """)
+            return [dict(row) for row in cur.fetchall()]
+    
+    def update_position_price(self, position_id: int, current_spy: float, unrealized_pnl: float):
+        """Update position with current price."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE positions SET
+                    current_spy_price = %s,
+                    unrealized_pnl = %s,
+                    last_updated = NOW()
+                WHERE id = %s
+            """, (current_spy, unrealized_pnl, position_id))
+            self.conn.commit()
+    
+    def close_position(
+        self,
+        position_id: int,
+        exit_spy_price: float,
+        exit_reason: str,
+        realized_pnl: float
+    ):
+        """Close a position."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE positions SET
+                    status = 'CLOSED',
+                    exit_time = NOW(),
+                    exit_spy_price = %s,
+                    exit_reason = %s,
+                    realized_pnl = %s
+                WHERE id = %s
+            """, (exit_spy_price, exit_reason, realized_pnl, position_id))
+            self.conn.commit()
+    
+    def get_position_summary(self) -> Dict:
+        """Get summary of positions."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as open_count,
+                    COUNT(CASE WHEN status = 'CLOSED' THEN 1 END) as closed_count,
+                    SUM(CASE WHEN status = 'CLOSED' THEN realized_pnl ELSE 0 END) as total_pnl,
+                    COUNT(CASE WHEN status = 'CLOSED' AND realized_pnl > 0 THEN 1 END) as winners,
+                    COUNT(CASE WHEN status = 'CLOSED' AND realized_pnl <= 0 THEN 1 END) as losers
+                FROM positions
+            """)
+            return dict(cur.fetchone())
 
 
 def init_database():
